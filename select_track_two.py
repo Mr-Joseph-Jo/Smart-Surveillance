@@ -29,10 +29,20 @@ frame_index = 0
 # Create a window for the visual analysis
 cv2.namedWindow("Pass 1: Analysis", cv2.WINDOW_NORMAL)
 
+# Initialize FPS calculation variables
+frame_count = 0
+start_time = time.time()
+
 while cap.isOpened():
     success, frame = cap.read()
     if not success:
         break
+    
+    frame_count += 1
+    if frame_count % 30 == 0:  # Update FPS every 30 frames
+        current_time = time.time()
+        fps = frame_count / (current_time - start_time)
+        print(f"\rPass 1 - FPS: {fps:.1f}", end="")
 
     # Resize frame
     frame = cv2.resize(frame, (RESIZE_WIDTH, RESIZE_HEIGHT))
@@ -53,7 +63,7 @@ while cap.isOpened():
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             label = f"ID: {track_id}"
             cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
+    
     # Display the frame
     cv2.imshow("Pass 1: Analysis", frame)
 
@@ -100,7 +110,7 @@ print(f"Target ID {target_id} selected.")
 # =================================================================================
 # PASS 2: GENERATE OUTPUT VIDEO WITH TRAIL
 # =================================================================================
-print("Starting Pass 2: Generating output video with trail...")
+print("\nStarting Pass 2: Generating output video with trail...")
 
 cap = cv2.VideoCapture(VIDEO_PATH)
 fourcc = cv2.VideoWriter_fourcc(*'XVID')
@@ -110,6 +120,14 @@ out = cv2.VideoWriter(OUTPUT_FILENAME, fourcc, fps_out, frame_size)
 trail_mask = np.zeros((RESIZE_HEIGHT, RESIZE_WIDTH, 3), dtype=np.uint8)
 historical_points = []
 frame_index = 0
+
+# Initialize FPS calculation variables for Pass 2
+frame_count = 0
+start_time = time.time()
+
+# Initialize FPS calculation variables for Pass 2
+fps = 0
+prev_time = time.time()
 
 while cap.isOpened():
     success, frame = cap.read()
@@ -139,6 +157,13 @@ while cap.isOpened():
     if cv2.waitKey(1) & 0xFF == ord("q"):
          break
     frame_index += 1
+    
+    # Calculate and display FPS
+    frame_count += 1
+    if frame_count % 30 == 0:  # Update FPS every 30 frames
+        current_time = time.time()
+        fps = frame_count / (current_time - start_time)
+        print(f"\rPass 2 - FPS: {fps:.1f}", end="")
 
 print(f"\nProcessing finished. Output video saved as {OUTPUT_FILENAME}")
 cap.release()

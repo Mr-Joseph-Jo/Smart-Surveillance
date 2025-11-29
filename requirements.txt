@@ -1,0 +1,9 @@
+torch
+opencv-python
+numpy
+scipy
+ultralytics
+supervision
+mediapipe
+torchvision
+scikit-learn

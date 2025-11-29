@@ -174,8 +174,8 @@ class EnhancedPersonReIDSystem:
         # Config
         self.target_features = None
         self.target_tracker_id = None
-        self.cam1_source = "samplesurv_one.mp4" # CHANGE THESE PATHS
-        self.cam2_source = "samplesurv_two_.mp4"
+        self.cam1_source = "videos/4PTF1.avi" # CHANGE THESE PATHS
+        self.cam2_source = "videos/4PTF2.avi" # CHANGE THESE PATHS
         
         # Thresholds
         self.similarity_threshold = 0.60 

@@ -1,7 +1,7 @@
 """
-Pose-Based Person Re-Identification System with YOLOv8-Pose
+Pose-Based Person Re-Identification System with YOLOv8-Pose + ByteTrack
 Two-video demo: Register from video 1, identify in video 2
-ENHANCED VERSION: Multi-frame registration + Better matching
+ENHANCED VERSION: Multi-frame registration + ByteTrack tracking + Better matching
 """
 
 import cv2
@@ -9,10 +9,10 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 from scipy.spatial.distance import cosine, euclidean
-from collections import deque
+from collections import deque, defaultdict
 import json
 
-# Import YOLO
+# Import YOLO with tracking
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
@@ -30,6 +30,7 @@ class PoseFeatures:
     camera_id: str
     bbox: Tuple[int, int, int, int]
     confidence: float = 0.0
+    track_id: int = -1  # ByteTrack ID
     
 class PoseFeatureExtractor:
     """Extract discriminative features from pose keypoints"""
@@ -164,7 +165,7 @@ class PoseReIDMatcher:
     
     def __init__(self, similarity_threshold: float = 0.65):
         self.similarity_threshold = similarity_threshold
-        self.gallery: Dict[int, List[PoseFeatures]] = {}  # Store MULTIPLE frames per person
+        self.gallery: Dict[int, List[PoseFeatures]] = {}  # person_id -> List of features
         
     def add_to_gallery(self, pose_features: PoseFeatures):
         """Add a person's pose features to gallery"""
@@ -237,7 +238,7 @@ class PoseReIDMatcher:
 
 
 class PoseReIDSystem:
-    """Complete Pose-based Re-Identification System using YOLOv8-Pose"""
+    """Complete Pose-based Re-Identification System using YOLOv8-Pose + ByteTrack"""
     
     def __init__(self, model_path: str = 'yolov8n-pose.pt'):
         if not YOLO_AVAILABLE:
@@ -249,9 +250,18 @@ class PoseReIDSystem:
         self.matcher = PoseReIDMatcher(similarity_threshold=0.65)
         print("✓ System initialized successfully")
         
-    def detect_all_persons(self, frame: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray, Tuple[int, int, int, int], float]]:
-        """Detect all persons in frame with their poses"""
-        results = self.yolo_model(frame, verbose=False)
+        # Track ID mapping: track_id -> reid_person_id
+        self.track_to_reid_map: Dict[int, int] = {}
+        
+    def detect_and_track(self, frame: np.ndarray, persist: bool = True) -> List[Tuple[int, np.ndarray, np.ndarray, Tuple[int, int, int, int], float]]:
+        """
+        Detect and track all persons using ByteTrack
+        
+        Returns:
+            List of (track_id, keypoints, confidences, bbox, avg_confidence)
+        """
+        # Use YOLO tracking (includes ByteTrack)
+        results = self.yolo_model.track(frame, persist=persist, verbose=False, tracker="bytetrack.yaml")
         persons = []
         
         if len(results) == 0:
@@ -262,25 +272,35 @@ class PoseReIDSystem:
         if result.boxes is None or result.keypoints is None:
             return persons
         
+        # Check if tracking IDs are available
+        if result.boxes.id is None:
+            return persons
+        
         num_persons = len(result.boxes)
         
         for i in range(num_persons):
+            # Get tracking ID from ByteTrack
+            track_id = int(result.boxes.id[i].item())
+            
+            # Get bbox
             box = result.boxes[i].xyxy[0].cpu().numpy()
             bbox = tuple(map(int, box))
             
+            # Get keypoints
             kp = result.keypoints.xy[i].cpu().numpy()
             conf = result.keypoints.conf[i].cpu().numpy() if result.keypoints.conf is not None else np.ones(17)
             avg_conf = float(np.mean(conf))
             
             if avg_conf > 0.3:
-                persons.append((kp, conf, bbox, avg_conf))
+                persons.append((track_id, kp, conf, bbox, avg_conf))
         
         return persons
     
     def process_frame(self, frame: np.ndarray, person_id: int, 
                      camera_id: str, bbox: Tuple[int, int, int, int],
                      timestamp: float, keypoints: np.ndarray,
-                     confidences: np.ndarray, avg_conf: float) -> Optional[PoseFeatures]:
+                     confidences: np.ndarray, avg_conf: float, 
+                     track_id: int = -1) -> Optional[PoseFeatures]:
         """Process a single frame to extract pose features"""
         features = self.feature_extractor.extract_features(keypoints, confidences)
         
@@ -294,7 +314,8 @@ class PoseReIDSystem:
             timestamp=timestamp,
             camera_id=camera_id,
             bbox=bbox,
-            confidence=avg_conf
+            confidence=avg_conf,
+            track_id=track_id
         )
         
         return pose_features
@@ -306,6 +327,10 @@ class PoseReIDSystem:
     def identify_person(self, pose_features: PoseFeatures) -> Tuple[Optional[int], float, Dict]:
         """Identify a person across cameras"""
         return self.matcher.match(pose_features)
+    
+    def update_track_mapping(self, track_id: int, reid_id: int):
+        """Update the mapping between ByteTrack ID and ReID person ID"""
+        self.track_to_reid_map[track_id] = reid_id
 
 
 class MouseSelector:
@@ -326,7 +351,8 @@ class MouseSelector:
         
         x, y = self.selected_point
         
-        for idx, (kp, conf, bbox, avg_conf) in enumerate(persons):
+        for idx, person_data in enumerate(persons):
+            bbox = person_data[3]  # bbox is at index 3
             x1, y1, x2, y2 = bbox
             if x1 <= x <= x2 and y1 <= y <= y2:
                 self.selecting = False
@@ -339,14 +365,15 @@ class MouseSelector:
 
 
 def process_video_1_registration(reid_system: PoseReIDSystem, video_path: str, 
-                                  num_frames_to_collect: int = 30) -> bool:
+                                  num_frames_to_collect: int = 30) -> Tuple[bool, int]:
     """
-    Process first video - collect MULTIPLE frames of selected person
+    Process first video - collect MULTIPLE frames of selected person with ByteTrack
     
-    THIS IS THE KEY IMPROVEMENT: Collects 30 frames instead of just 1!
+    Returns:
+        (registered_success, registered_person_id)
     """
     print("\n" + "=" * 70)
-    print("VIDEO 1: Registration Phase")
+    print("VIDEO 1: Registration Phase (with ByteTrack)")
     print("=" * 70)
     print(f"Instructions: Click on a person to register them")
     print(f"System will collect {num_frames_to_collect} frames for robust matching")
@@ -356,7 +383,7 @@ def process_video_1_registration(reid_system: PoseReIDSystem, video_path: str,
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"✗ Could not open video: {video_path}")
-        return False
+        return False, -1
     
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -369,12 +396,13 @@ def process_video_1_registration(reid_system: PoseReIDSystem, video_path: str,
     cv2.setMouseCallback(window_name, mouse_selector.mouse_callback)
     
     registered = False
+    registered_person_id = -1
     frame_count = 0
     paused = False
     
     # Collection mode variables
     collecting_mode = False
-    selected_person_idx = None
+    selected_track_id = None
     frames_collected = 0
     
     while True:
@@ -385,15 +413,16 @@ def process_video_1_registration(reid_system: PoseReIDSystem, video_path: str,
                 continue
             frame_count += 1
         
-        persons = reid_system.detect_all_persons(frame)
+        # Detect and track persons using ByteTrack
+        persons = reid_system.detect_and_track(frame, persist=True)
         display_frame = frame.copy()
         
         if not collecting_mode:
-            # NORMAL MODE: Show all persons
-            for idx, (kp, conf, bbox, avg_conf) in enumerate(persons):
+            # NORMAL MODE: Show all tracked persons
+            for track_id, kp, conf, bbox, avg_conf in persons:
                 x1, y1, x2, y2 = bbox
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(display_frame, f"Person {idx+1}", (x1, y1-10),
+                cv2.putText(display_frame, f"Track ID: {track_id}", (x1, y1-10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
                 for point in kp:
@@ -407,39 +436,47 @@ def process_video_1_registration(reid_system: PoseReIDSystem, video_path: str,
         
         else:
             # COLLECTION MODE: Track selected person and collect frames
-            if selected_person_idx < len(persons):
-                kp, conf, bbox, avg_conf = persons[selected_person_idx]
-                x1, y1, x2, y2 = bbox
-                
-                # Extract and register this frame
-                pose_features = reid_system.process_frame(
-                    frame, person_id=1, camera_id="video1",
-                    bbox=bbox, timestamp=frame_count/fps,
-                    keypoints=kp, confidences=conf, avg_conf=avg_conf
-                )
-                
-                if pose_features:
-                    reid_system.register_person(pose_features)  # Add to gallery
-                    frames_collected += 1
-                    print(f"  Collected frame {frames_collected}/{num_frames_to_collect} (conf: {avg_conf:.2f})")
-                
-                # Draw collection visualization
-                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                cv2.putText(display_frame, "COLLECTING...", (x1, y1-10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                
-                for point in kp:
-                    if point[0] > 0 and point[1] > 0:
-                        cv2.circle(display_frame, tuple(map(int, point)), 3, (0, 0, 255), -1)
+            person_found = False
+            for track_id, kp, conf, bbox, avg_conf in persons:
+                if track_id == selected_track_id:
+                    person_found = True
+                    x1, y1, x2, y2 = bbox
+                    
+                    # Extract and register this frame
+                    pose_features = reid_system.process_frame(
+                        frame, person_id=1, camera_id="video1",
+                        bbox=bbox, timestamp=frame_count/fps,
+                        keypoints=kp, confidences=conf, avg_conf=avg_conf,
+                        track_id=track_id
+                    )
+                    
+                    if pose_features:
+                        reid_system.register_person(pose_features)
+                        frames_collected += 1
+                        print(f"  Collected frame {frames_collected}/{num_frames_to_collect} (Track ID: {track_id}, conf: {avg_conf:.2f})")
+                    
+                    # Draw collection visualization
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                    cv2.putText(display_frame, f"COLLECTING Track ID: {track_id}", (x1, y1-10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    
+                    for point in kp:
+                        if point[0] > 0 and point[1] > 0:
+                            cv2.circle(display_frame, tuple(map(int, point)), 3, (0, 0, 255), -1)
+                    break
+            
+            if not person_found:
+                cv2.putText(display_frame, f"Waiting for Track ID {selected_track_id}...", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
             
             # Progress bar
             progress = int((frames_collected / num_frames_to_collect) * 100)
             cv2.putText(display_frame, f"Collecting: {frames_collected}/{num_frames_to_collect} ({progress}%)", 
-                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                       (10, 60 if not person_found else 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             
             bar_width = 400
             bar_height = 30
-            bar_x, bar_y = 10, 50
+            bar_x, bar_y = 10, 90 if not person_found else 120
             cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 2)
             filled_width = int((frames_collected / num_frames_to_collect) * bar_width)
             cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x + filled_width, bar_y + bar_height), (0, 255, 0), -1)
@@ -447,6 +484,7 @@ def process_video_1_registration(reid_system: PoseReIDSystem, video_path: str,
             # Check if collection complete
             if frames_collected >= num_frames_to_collect:
                 print(f"\n✓ Registration complete!")
+                print(f"  Track ID: {selected_track_id}")
                 print(f"  Total frames collected: {frames_collected}")
                 print(f"  Gallery now has: {len(reid_system.matcher.gallery[1])} frames for person 1")
                 
@@ -457,6 +495,7 @@ def process_video_1_registration(reid_system: PoseReIDSystem, video_path: str,
                 cv2.waitKey(2000)
                 
                 registered = True
+                registered_person_id = 1
                 break
         
         cv2.imshow(window_name, display_frame)
@@ -464,10 +503,10 @@ def process_video_1_registration(reid_system: PoseReIDSystem, video_path: str,
         # Check for person selection
         if not collecting_mode:
             selected_idx = mouse_selector.get_selected_person(persons)
-            if selected_idx is not None:
-                print(f"\n✓ Person {selected_idx + 1} selected")
+            if selected_idx is not None and selected_idx < len(persons):
+                selected_track_id = persons[selected_idx][0]  # track_id is first element
+                print(f"\n✓ Person with Track ID {selected_track_id} selected")
                 print(f"  Starting collection of {num_frames_to_collect} frames...")
-                selected_person_idx = selected_idx
                 collecting_mode = True
                 frames_collected = 0
         
@@ -480,16 +519,17 @@ def process_video_1_registration(reid_system: PoseReIDSystem, video_path: str,
     cap.release()
     cv2.destroyAllWindows()
     
-    return registered
+    return registered, registered_person_id
 
 
-def process_video_2_identification(reid_system: PoseReIDSystem, video_path: str):
-    """Process second video - identify registered person"""
+def process_video_2_identification(reid_system: PoseReIDSystem, video_path: str, 
+                                    registered_person_id: int):
+    """Process second video - identify registered person with ByteTrack IDs"""
     print("\n" + "=" * 70)
-    print("VIDEO 2: Identification Phase")
+    print("VIDEO 2: Identification Phase (with ByteTrack)")
     print("=" * 70)
     print("Searching for the registered person...")
-    print(f"Gallery has {len(reid_system.matcher.gallery[1])} reference frames")
+    print(f"Gallery has {len(reid_system.matcher.gallery[registered_person_id])} reference frames")
     print("Press 'q' to quit")
     print()
     
@@ -508,6 +548,7 @@ def process_video_2_identification(reid_system: PoseReIDSystem, video_path: str)
     
     frame_count = 0
     matches_found = 0
+    track_match_counts = defaultdict(int)  # Count matches per track_id
     
     while True:
         ret, frame = cap.read()
@@ -515,35 +556,54 @@ def process_video_2_identification(reid_system: PoseReIDSystem, video_path: str)
             break
         
         frame_count += 1
-        persons = reid_system.detect_all_persons(frame)
+        
+        # Detect and track persons
+        persons = reid_system.detect_and_track(frame, persist=True)
         display_frame = frame.copy()
         
-        for idx, (kp, conf, bbox, avg_conf) in enumerate(persons):
+        for track_id, kp, conf, bbox, avg_conf in persons:
             x1, y1, x2, y2 = bbox
             
+            # Extract features
             pose_features = reid_system.process_frame(
-                frame, person_id=999+idx, camera_id="video2",
+                frame, person_id=999, camera_id="video2",
                 bbox=bbox, timestamp=frame_count/fps,
-                keypoints=kp, confidences=conf, avg_conf=avg_conf
+                keypoints=kp, confidences=conf, avg_conf=avg_conf,
+                track_id=track_id
             )
             
             if pose_features:
                 matched_id, similarity, debug_info = reid_system.identify_person(pose_features)
                 
-                if matched_id is not None:
-                    matches_found += 1
+                # Check if this track_id already has a ReID mapping
+                if track_id in reid_system.track_to_reid_map:
+                    reid_id = reid_system.track_to_reid_map[track_id]
                     color = (0, 255, 0)
-                    label = f"MATCH! ID:{matched_id} ({similarity:.2f})"
+                    label = f"ReID:{reid_id} | Track:{track_id} ({similarity:.2f})"
                     thickness = 3
-                    print(f"[Frame {frame_count}] ✓ MATCH! Sim: {similarity:.3f} | Debug: {debug_info[matched_id]}")
+                elif matched_id is not None:
+                    # NEW MATCH FOUND!
+                    matches_found += 1
+                    track_match_counts[track_id] += 1
+                    
+                    # Map this track_id to the matched reid_id
+                    reid_system.update_track_mapping(track_id, matched_id)
+                    
+                    color = (0, 255, 0)
+                    label = f"MATCH! ReID:{matched_id} | Track:{track_id} ({similarity:.2f})"
+                    thickness = 3
+                    
+                    print(f"[Frame {frame_count}] ✓ MATCH! Track ID: {track_id} → ReID: {matched_id} | Sim: {similarity:.3f}")
+                    print(f"  Debug: {debug_info[matched_id]}")
                 else:
+                    # No match
                     color = (0, 0, 255)
-                    label = f"Person {idx+1} ({similarity:.2f})"
+                    label = f"Track:{track_id} ({similarity:.2f})"
                     thickness = 2
                 
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, thickness)
                 cv2.putText(display_frame, label, (x1, y1-10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 
                 for point in kp:
                     if point[0] > 0 and point[1] > 0:
@@ -553,19 +613,27 @@ def process_video_2_identification(reid_system: PoseReIDSystem, video_path: str)
                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
         cv2.putText(display_frame, f"Frame: {frame_count}/{total_frames} | Matches: {matches_found}", 
                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(display_frame, f"Active mappings: {len(reid_system.track_to_reid_map)}", 
+                   (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         cv2.imshow(window_name, display_frame)
         
         if cv2.waitKey(30) & 0xFF == ord('q'):
             break
+        
+        
     
     cap.release()
     cv2.destroyAllWindows()
-    
+
     print(f"\n✓ Video 2 processing complete")
     print(f"  Total matches found: {matches_found}")
     print(f"  Total frames processed: {frame_count}")
     print(f"  Match rate: {matches_found/frame_count*100:.1f}%")
+    print(f"\n📊 Per-Track Match Statistics:")
+    for track_id, count in sorted(track_match_counts.items()):
+        reid_id = reid_system.track_to_reid_map.get(track_id, "Unknown")
+        print(f"  Track ID {track_id} → ReID {reid_id}: {count} matches")
 
 
 def main():
@@ -591,13 +659,10 @@ def main():
         reid_system = PoseReIDSystem(model_path='yolov8n-pose.pt')
         
         # Collect 30 frames for robust registration
-        registered = process_video_1_registration(reid_system, video1_path, num_frames_to_collect=30)
-        
-        if not registered:
-            print("\n✗ No person was registered. Exiting.")
-            return
-        
-        process_video_2_identification(reid_system, video2_path)
+        registered, registered_person_id = process_video_1_registration(
+            reid_system, video1_path, num_frames_to_collect=60
+        )
+        process_video_2_identification(reid_system, video2_path, registered_person_id)
         
         print("\n✓ Demo complete!")
         

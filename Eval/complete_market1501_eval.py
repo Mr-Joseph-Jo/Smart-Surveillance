@@ -62,7 +62,9 @@ class Market1501Evaluator:
     
     def __init__(self, dataset_root: str):
         self.dataset_root = Path(dataset_root)
-        self.gallery_dir = self.dataset_root / "bounding_box_train"
+        
+        # FIX 1: Gallery must be the TEST set, not TRAIN set
+        self.gallery_dir = self.dataset_root / "bounding_box_test"
         self.query_dir = self.dataset_root / "query"
         
         print("Loading Market-1501...")
@@ -74,7 +76,8 @@ class Market1501Evaluator:
     
     def _load_samples(self, directory: Path) -> List[Market1501Sample]:
         samples = []
-        for img_path in directory.glob("*.jpg"):
+        # Support both jpg and png just in case
+        for img_path in list(directory.glob("*.jpg")) + list(directory.glob("*.png")):
             sample = Market1501Sample.parse_filename(img_path.name, str(img_path))
             if sample:
                 samples.append(sample)
@@ -83,20 +86,18 @@ class Market1501Evaluator:
     def evaluate_experiment(self, reid_system, experiment_name: str) -> Dict:
         """
         Evaluate a single experiment configuration
-        
-        Args:
-            reid_system: MultiModalReID instance
-            experiment_name: e.g., "Pose Only", "Pose+Hair"
         """
         print(f"\n{'='*70}")
         print(f"Experiment: {experiment_name}")
         print(f"{'='*70}")
         
-        # Extract gallery features
+        # --- 1. Extract Gallery Features ---
         print("Extracting gallery features...")
         gallery_features = []
         failed_gallery = 0
         
+        # Pre-process: Resize slightly for YOLO if needed inside your extractor
+        # but here we just pass the image
         for sample in tqdm(self.gallery, desc="Gallery"):
             try:
                 image = cv2.imread(sample.image_path)
@@ -106,8 +107,8 @@ class Market1501Evaluator:
                 
                 features = reid_system.extract_features(image)
                 
-                # Only add if features were successfully extracted
-                if features is not None and any(features.values()):
+                # Check if we got valid features
+                if features is not None and any(v is not None for v in features.values()):
                     gallery_features.append({
                         'sample': sample,
                         'features': features
@@ -120,13 +121,11 @@ class Market1501Evaluator:
         
         print(f"✓ Gallery features: {len(gallery_features)} (failed: {failed_gallery})")
         
-        # Debug: Check feature quality
-        if len(gallery_features) > 0:
-            sample_feat = gallery_features[0]['features']
-            print(f"  Sample feature keys: {list(sample_feat.keys())}")
-            print(f"  Sample feature values: {[type(v).__name__ if v else 'None' for v in sample_feat.values()]}")
-        
-        # Extract query features
+        if len(gallery_features) == 0:
+            print("CRITICAL ERROR: No gallery features extracted. Check paths or feature extractor.")
+            return {'name': experiment_name, 'metrics': {'rank_1': 0, 'mAP': 0}, 'results': []}
+
+        # --- 2. Extract Query Features ---
         print("Extracting query features...")
         query_features = []
         failed_query = 0
@@ -140,27 +139,20 @@ class Market1501Evaluator:
                 
                 features = reid_system.extract_features(image)
                 
-                # Only add if features were successfully extracted
-                if features is not None and any(features.values()):
+                if features is not None and any(v is not None for v in features.values()):
                     query_features.append({
                         'sample': sample,
                         'features': features
                     })
                 else:
                     failed_query += 1
-            except Exception as e:
+            except Exception:
                 failed_query += 1
                 continue
         
         print(f"✓ Query features: {len(query_features)} (failed: {failed_query})")
         
-        # Debug: Check feature quality
-        if len(query_features) > 0:
-            sample_feat = query_features[0]['features']
-            print(f"  Sample feature keys: {list(sample_feat.keys())}")
-            print(f"  Sample feature values: {[type(v).__name__ if v else 'None' for v in sample_feat.values()]}")
-        
-        # Compute matches
+        # --- 3. Compute Matching ---
         print("Computing similarities...")
         results = []
         
@@ -168,39 +160,38 @@ class Market1501Evaluator:
             query_sample = query['sample']
             query_feat = query['features']
             
-            # Skip if no features extracted
-            if query_feat is None or not any(v is not None for v in query_feat.values()):
-                continue
-            
             rankings = []
             for gallery in gallery_features:
                 gallery_sample = gallery['sample']
                 gallery_feat = gallery['features']
                 
-                # Skip same camera
-                if query_sample.camera_id == gallery_sample.camera_id:
+                # FIX 2: Standard Market-1501 Evaluation Protocol
+                # 1. Skip junk images (ID 0 or -1)
+                if gallery_sample.person_id <= 0:
                     continue
-                
-                # Skip if no features
-                if gallery_feat is None or not any(v is not None for v in gallery_feat.values()):
+                    
+                # 2. Skip same person in same camera (The "Junk" Rule)
+                # We KEEP "distractors" (different people in same camera)
+                if (query_sample.person_id == gallery_sample.person_id and 
+                    query_sample.camera_id == gallery_sample.camera_id):
                     continue
                 
                 # Compute similarity
                 try:
                     sim = reid_system.compute_similarity(query_feat, gallery_feat)
-                except Exception as e:
+                except Exception:
                     sim = 0.0
                 
                 rankings.append({
                     'gallery_id': gallery_sample.person_id,
+                    'camera_id': gallery_sample.camera_id,
                     'similarity': sim,
                     'is_match': gallery_sample.person_id == query_sample.person_id
                 })
             
-            # Sort by similarity
+            # Sort by similarity (Highest first)
             rankings = sorted(rankings, key=lambda x: x['similarity'], reverse=True)
             
-            # Only add if we have rankings
             if rankings:
                 results.append({
                     'query_id': query_sample.person_id,
@@ -209,7 +200,7 @@ class Market1501Evaluator:
         
         print(f"✓ Matched {len(results)} queries")
         
-        # Compute metrics
+        # --- 4. Compute Metrics ---
         print("Computing metrics...")
         metrics = self._compute_metrics(results)
         
@@ -223,32 +214,42 @@ class Market1501Evaluator:
     
     def _compute_metrics(self, results: List[Dict]) -> Dict:
         """Compute Rank-k and mAP"""
+        if not results:
+            return {'rank_1': 0.0, 'rank_5': 0.0, 'rank_10': 0.0, 'rank_20': 0.0, 'mAP': 0.0, 'num_queries': 0}
+
         rank_accuracies = {1: 0, 5: 0, 10: 0, 20: 0}
         aps = []
         
         for result in results:
             rankings = result['rankings']
             
-            # Find correct match ranks
-            correct_ranks = [i for i, r in enumerate(rankings) if r['is_match']]
+            # Find indices where is_match is True
+            correct_indices = [i for i, r in enumerate(rankings) if r['is_match']]
             
-            if not correct_ranks:
+            if not correct_indices:
                 aps.append(0.0)
                 continue
             
-            # Rank-k accuracy
-            first_rank = correct_ranks[0]
+            # Rank-k accuracy (Is the first match within top k?)
+            first_match_idx = correct_indices[0]
             for k in [1, 5, 10, 20]:
-                if first_rank < k:
+                if first_match_idx < k:
                     rank_accuracies[k] += 1
             
-            # Average Precision
-            precisions = []
-            for i, rank in enumerate(correct_ranks):
-                precision = (i + 1) / (rank + 1)
-                precisions.append(precision)
+            # Average Precision (AP)
+            # AP = (1/num_positive) * sum(precision_at_k * rel_k)
+            num_positive = len(correct_indices)
+            running_correct = 0
+            precision_sum = 0.0
             
-            aps.append(np.mean(precisions) if precisions else 0.0)
+            for i, r in enumerate(rankings):
+                if r['is_match']:
+                    running_correct += 1
+                    precision = running_correct / (i + 1)
+                    precision_sum += precision
+            
+            ap = precision_sum / num_positive
+            aps.append(ap)
         
         num_queries = len(results)
         
@@ -257,7 +258,7 @@ class Market1501Evaluator:
             'rank_5': rank_accuracies[5] / num_queries,
             'rank_10': rank_accuracies[10] / num_queries,
             'rank_20': rank_accuracies[20] / num_queries,
-            'mAP': np.mean(aps),
+            'mAP': np.mean(aps) if aps else 0.0,
             'num_queries': num_queries
         }
     
@@ -270,10 +271,13 @@ class Market1501Evaluator:
         print(f"  Rank-20: {metrics['rank_20']*100:.2f}%")
         print(f"  mAP:     {metrics['mAP']*100:.2f}%")
         print(f"{'─'*50}")
-    
+
     def plot_cmc_comparison(self, all_experiments: List[Dict], save_path: str = "cmc_comparison.png"):
         """Plot CMC curves for all experiments"""
-        plt.figure(figsize=(12, 7))
+        if not all_experiments:
+            return
+
+        plt.figure(figsize=(10, 6))
         
         colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8']
         markers = ['o', 's', '^', 'D', 'v']
@@ -282,142 +286,79 @@ class Market1501Evaluator:
             name = experiment['name']
             results = experiment['results']
             
+            if not results:
+                continue
+
             # Compute CMC
-            ranks = range(1, 21)
+            ranks_range = range(1, 21)
             accuracies = []
             
-            for k in ranks:
+            for k in ranks_range:
                 correct = 0
                 for result in results:
                     rankings = result['rankings']
-                    top_k_correct = any(r['is_match'] for r in rankings[:k])
-                    if top_k_correct:
+                    # Check if any match in top k
+                    if any(r['is_match'] for r in rankings[:k]):
                         correct += 1
                 accuracy = correct / len(results)
                 accuracies.append(accuracy * 100)
             
-            plt.plot(ranks, accuracies, 
+            plt.plot(ranks_range, accuracies, 
                     marker=markers[idx % len(markers)],
                     color=colors[idx % len(colors)],
-                    linewidth=2.5,
-                    markersize=6,
+                    linewidth=2,
+                    markersize=5,
                     label=name)
         
-        plt.xlabel('Rank', fontsize=12, fontweight='bold')
-        plt.ylabel('Matching Rate (%)', fontsize=12, fontweight='bold')
-        plt.title('Cumulative Matching Characteristic (CMC) Curve\nMarket-1501 Dataset', 
-                 fontsize=14, fontweight='bold')
-        plt.legend(fontsize=11, loc='lower right')
-        plt.grid(True, alpha=0.3, linestyle='--')
+        plt.xlabel('Rank')
+        plt.ylabel('Matching Rate (%)')
+        plt.title('CMC Curve - Market-1501')
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.5)
         plt.xlim([1, 20])
         plt.ylim([0, 100])
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=300)
         print(f"✓ CMC curve saved: {save_path}")
         plt.close()
-    
-    def generate_comparison_table(self, all_experiments: List[Dict], 
-                                  save_path: str = "results_table.csv"):
-        """Generate comparison table"""
+
+    def generate_comparison_table(self, all_experiments: List[Dict], save_path: str = "results_table.csv"):
+        """Generate CSV table"""
         data = []
-        
         for experiment in all_experiments:
-            name = experiment['name']
-            metrics = experiment['metrics']
-            
+            m = experiment['metrics']
             data.append({
-                'Method': name,
-                'Rank-1 (%)': f"{metrics['rank_1']*100:.2f}",
-                'Rank-5 (%)': f"{metrics['rank_5']*100:.2f}",
-                'Rank-10 (%)': f"{metrics['rank_10']*100:.2f}",
-                'Rank-20 (%)': f"{metrics['rank_20']*100:.2f}",
-                'mAP (%)': f"{metrics['mAP']*100:.2f}"
+                'Method': experiment['name'],
+                'Rank-1': m['rank_1'],
+                'Rank-5': m['rank_5'],
+                'mAP': m['mAP']
             })
-        
         df = pd.DataFrame(data)
         df.to_csv(save_path, index=False)
-        
-        print(f"\n✓ Results table saved: {save_path}")
-        print("\n" + df.to_string(index=False))
-        
-        return df
-    
-    def generate_latex_table(self, all_experiments: List[Dict],
-                            save_path: str = "results_latex.txt"):
-        """Generate LaTeX table for paper"""
+        print(f"✓ Table saved: {save_path}")
+
+    def generate_latex_table(self, all_experiments: List[Dict], save_path: str = "results_latex.txt"):
+        """Generate LaTeX"""
         with open(save_path, 'w') as f:
-            f.write("\\begin{table}[h]\n")
-            f.write("\\centering\n")
-            f.write("\\caption{Performance Comparison on Market-1501 Dataset}\n")
-            f.write("\\label{tab:market1501_results}\n")
-            f.write("\\begin{tabular}{l|ccccc}\n")
-            f.write("\\hline\n")
-            f.write("Method & Rank-1 & Rank-5 & Rank-10 & Rank-20 & mAP \\\\\n")
-            f.write("\\hline\n")
-            
-            for experiment in all_experiments:
-                name = experiment['name']
-                m = experiment['metrics']
-                f.write(f"{name} & {m['rank_1']*100:.2f} & {m['rank_5']*100:.2f} & "
-                       f"{m['rank_10']*100:.2f} & {m['rank_20']*100:.2f} & {m['mAP']*100:.2f} \\\\\n")
-            
-            f.write("\\hline\n")
-            f.write("\\end{tabular}\n")
-            f.write("\\end{table}\n")
-        
-        print(f"✓ LaTeX table saved: {save_path}")
-    
-    def generate_full_report(self, all_experiments: List[Dict],
-                           save_path: str = "full_report.txt"):
-        """Generate comprehensive report"""
-        with open(save_path, 'w', encoding='utf-8') as f:
-            f.write("="*70 + "\n")
-            f.write("MARKET-1501 MULTI-MODAL RE-IDENTIFICATION EVALUATION REPORT\n")
-            f.write("="*70 + "\n\n")
-            
-            f.write(f"Dataset: Market-1501\n")
-            f.write(f"Gallery Size: {len(self.gallery)} images\n")
-            f.write(f"Query Size: {len(self.query)} images\n\n")
-            
-            f.write("EXPERIMENTS CONDUCTED:\n")
-            for i, exp in enumerate(all_experiments, 1):
-                f.write(f"{i}. {exp['name']}\n")
-            f.write("\n")
-            
-            for experiment in all_experiments:
-                name = experiment['name']
-                metrics = experiment['metrics']
-                
-                f.write("-"*70 + "\n")
-                f.write(f"{name}\n")
-                f.write("-"*70 + "\n")
-                f.write(f"Rank-1 Accuracy:  {metrics['rank_1']*100:.2f}%\n")
-                f.write(f"Rank-5 Accuracy:  {metrics['rank_5']*100:.2f}%\n")
-                f.write(f"Rank-10 Accuracy: {metrics['rank_10']*100:.2f}%\n")
-                f.write(f"Rank-20 Accuracy: {metrics['rank_20']*100:.2f}%\n")
-                f.write(f"Mean Average Precision (mAP): {metrics['mAP']*100:.2f}%\n")
-                f.write(f"Queries Evaluated: {metrics['num_queries']}\n\n")
-            
-            # Performance improvement analysis
-            if len(all_experiments) > 1:
-                f.write("="*70 + "\n")
-                f.write("PERFORMANCE IMPROVEMENT ANALYSIS\n")
-                f.write("="*70 + "\n\n")
-                
-                baseline = all_experiments[0]
-                baseline_rank1 = baseline['metrics']['rank_1']
-                baseline_map = baseline['metrics']['mAP']
-                
-                for exp in all_experiments[1:]:
-                    rank1_improvement = (exp['metrics']['rank_1'] - baseline_rank1) * 100
-                    map_improvement = (exp['metrics']['mAP'] - baseline_map) * 100
-                    
-                    f.write(f"{exp['name']} vs {baseline['name']}:\n")
-                    f.write(f"  Rank-1 improvement: {rank1_improvement:+.2f}%\n")
-                    f.write(f"  mAP improvement: {map_improvement:+.2f}%\n\n")
-        
-        print(f"✓ Full report saved: {save_path}")
+            f.write("\\begin{table}[h]\n\\centering\n")
+            f.write("\\begin{tabular}{l|ccc}\n\\hline\n")
+            f.write("Method & Rank-1 & Rank-5 & mAP \\\\\n\\hline\n")
+            for exp in all_experiments:
+                m = exp['metrics']
+                f.write(f"{exp['name']} & {m['rank_1']*100:.1f} & {m['rank_5']*100:.1f} & {m['mAP']*100:.1f} \\\\\n")
+            f.write("\\hline\n\\end{tabular}\n\\end{table}")
+        print(f"✓ LaTeX saved: {save_path}")
+
+    def generate_full_report(self, all_experiments: List[Dict], save_path: str = "full_report.txt"):
+        """Generate text report"""
+        with open(save_path, 'w') as f:
+            f.write("MARKET-1501 EVALUATION REPORT\n")
+            f.write("=============================\n\n")
+            for exp in all_experiments:
+                m = exp['metrics']
+                f.write(f"Experiment: {exp['name']}\n")
+                f.write(f"  Rank-1: {m['rank_1']*100:.2f}%\n")
+                f.write(f"  mAP:    {m['mAP']*100:.2f}%\n\n")
+        print(f"✓ Report saved: {save_path}")
 
 
 # ==================== MAIN EVALUATION SCRIPT ====================

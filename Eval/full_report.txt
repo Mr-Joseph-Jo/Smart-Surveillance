@@ -1,0 +1,11 @@
+MARKET-1501 EVALUATION REPORT
+=============================
+
+Experiment: Pose Only
+  Rank-1: 0.13%
+  mAP:    0.26%
+
+Experiment: Pose + Hair
+  Rank-1: 0.62%
+  mAP:    0.34%
+

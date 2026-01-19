@@ -1,1 +1,7 @@
 /.venv
+
+# Ignore local market dataset folder
+market/
+
+# Ignore Market-1501 dataset under Eval
+/Eval/Market-1501-v15.09.15/

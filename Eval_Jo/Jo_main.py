@@ -412,8 +412,8 @@ def plot_ablation_study(experiments: List[Dict], out_path: Path):
 class MarketEvaluator:
     def __init__(self, root):
         self.root = Path(root)
-        self.gallery = self._load(self.root / "bounding_box_test")[:400]
-        self.query = self._load(self.root / "query")[:50]
+        self.gallery = self._load(self.root / "bounding_box_test")
+        self.query = self._load(self.root / "query")
         
     def save_cache(self, data, filename):
         path = Path(filename)

@@ -19,6 +19,8 @@ from tqdm import tqdm
 from dataclasses import dataclass
 from typing import List, Dict
 import matplotlib.pyplot as plt
+import torchreid
+from torchreid.utils import FeatureExtractor
 
 # Check for GPU
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -72,11 +74,64 @@ class DeepFeatureExtractor:
         img_pil = Image.fromarray(cv2.cvtColor(img_crop, cv2.COLOR_BGR2RGB))
         return self.transform(img_pil).unsqueeze(0).to(DEVICE)
 
+# class FaceModel(DeepFeatureExtractor):
+#     def __init__(self):
+#         super().__init__("FaceNet")
+#         # Suppress the pickle warning by loading explicitly if needed, but standard load is fine here
+#         self.net = InceptionResnetV1(pretrained='vggface2').eval().to(DEVICE)
+    
+#     def extract(self, img, kps):
+#         if kps is None: return None
+#         face_pts = kps[:5]
+#         valid = face_pts[face_pts[:,0] > 0]
+#         if len(valid) < 2: return None
+        
+#         x1, y1 = np.min(valid, axis=0)
+#         x2, y2 = np.max(valid, axis=0)
+#         h, w = img.shape[:2]
+#         pad = int((x2-x1) * 0.5) 
+#         crop = img[max(0, int(y1-pad)):min(h, int(y2+pad)), 
+#                    max(0, int(x1-pad)):min(w, int(x2+pad))]
+        
+#         tensor = self.preprocess(crop)
+#         if tensor is None: return None
+#         with torch.no_grad():
+#             emb = self.net(tensor)
+#         return emb.cpu().numpy().flatten()
+
+# class HairModel(DeepFeatureExtractor):
+#     def __init__(self):
+#         super().__init__("ResNet18-Hair")
+#         base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+#         self.net = nn.Sequential(*list(base.children())[:-1]).to(DEVICE).eval()
+        
+#     def extract(self, img, kps):
+#         if kps is None: return None
+#         nose = kps[0]
+#         if nose[0] == 0: return None
+#         crop = img[0:int(nose[1]), :]
+#         tensor = self.preprocess(crop)
+#         if tensor is None: return None
+#         with torch.no_grad():
+#             emb = self.net(tensor)
+#         return emb.cpu().numpy().flatten()
+# ==================== UPDATED MODELS (ALL OSNET) ====================
+
 class FaceModel(DeepFeatureExtractor):
+    """
+    NOW USING: OSNet for Face
+    Hypothesis: In low-res surveillance, a ReID model (texture matcher) 
+    might perform better than a specific Face Recognition model.
+    """
     def __init__(self):
-        super().__init__("FaceNet")
-        # Suppress the pickle warning by loading explicitly if needed, but standard load is fine here
-        self.net = InceptionResnetV1(pretrained='vggface2').eval().to(DEVICE)
+        # We use a separate OSNet instance just for faces
+        print("Loading OSNet (Face Branch)...")
+        self.extractor = FeatureExtractor(
+            model_name='osnet_ain_x1_0',
+            model_path='./log/osnet_duke/model/model.pth.tar-50', 
+            device=DEVICE,
+            image_size=(128, 128) # Faces are square-ish, so we adjust input size
+        )
     
     def extract(self, img, kps):
         if kps is None: return None
@@ -84,6 +139,7 @@ class FaceModel(DeepFeatureExtractor):
         valid = face_pts[face_pts[:,0] > 0]
         if len(valid) < 2: return None
         
+        # Crop logic
         x1, y1 = np.min(valid, axis=0)
         x2, y2 = np.max(valid, axis=0)
         h, w = img.shape[:2]
@@ -91,28 +147,38 @@ class FaceModel(DeepFeatureExtractor):
         crop = img[max(0, int(y1-pad)):min(h, int(y2+pad)), 
                    max(0, int(x1-pad)):min(w, int(x2+pad))]
         
-        tensor = self.preprocess(crop)
-        if tensor is None: return None
-        with torch.no_grad():
-            emb = self.net(tensor)
-        return emb.cpu().numpy().flatten()
+        if crop.size == 0: return None
+        
+        # OSNet Extract
+        features = self.extractor([crop])
+        return features[0].cpu().numpy()
 
 class HairModel(DeepFeatureExtractor):
+    """
+    NOW USING: OSNet for Hair
+    Hypothesis: OSNet captures fine-grained hair texture better than ResNet18.
+    """
     def __init__(self):
-        super().__init__("ResNet18-Hair")
-        base = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.net = nn.Sequential(*list(base.children())[:-1]).to(DEVICE).eval()
+        print("Loading OSNet (Hair Branch)...")
+        self.extractor = FeatureExtractor(
+            model_name='osnet_ain_x1_0',
+            model_path='./log/osnet_duke/model/model.pth.tar-50',
+            device=DEVICE,
+            image_size=(128, 256) # Hair is wide and short
+        )
         
     def extract(self, img, kps):
         if kps is None: return None
         nose = kps[0]
         if nose[0] == 0: return None
+        
+        # Crop Top (Hair)
         crop = img[0:int(nose[1]), :]
-        tensor = self.preprocess(crop)
-        if tensor is None: return None
-        with torch.no_grad():
-            emb = self.net(tensor)
-        return emb.cpu().numpy().flatten()
+        if crop.size == 0: return None
+        
+        # OSNet Extract
+        features = self.extractor([crop])
+        return features[0].cpu().numpy()
 
 class BodyColorModel(DeepFeatureExtractor):
     def __init__(self):
@@ -126,6 +192,31 @@ class BodyColorModel(DeepFeatureExtractor):
         with torch.no_grad():
             emb = self.net(tensor)
         return emb.cpu().numpy().flatten()
+class OSNetModel(DeepFeatureExtractor):
+    """
+    State-of-the-Art ReID Model (OSNet)
+    Pre-trained on Market-1501 for high accuracy.
+    """
+    def __init__(self):
+        # We don't call super() here because torchreid handles its own transforms
+        print("Loading OSNet (Ain_x1_0) pre-trained on Market-1501...")
+        
+        # This utility wrapper handles resizing, normalization, and inference automatically
+        self.extractor = FeatureExtractor(
+            model_name='osnet_ain_x1_0',  # 'ain' is a newer, faster version of OSNet
+            model_path='./log/osnet_duke/model/model.pth.tar-50',                # Empty string = download generic ImageNet/Market weights
+            device=DEVICE,
+            image_size=(256, 128)         # Standard ReID input size
+        )
+        
+    def extract(self, img):
+        if img is None or img.size == 0: return None
+        
+        # torchreid expects a list of images (even if just one)
+        # It handles BGR -> RGB conversion internally usually, but safe to pass straight CV2
+        # It returns a tensor, so we flatten it to numpy
+        features = self.extractor([img])
+        return features[0].cpu().numpy()
     
 class MaskedBodyModel(DeepFeatureExtractor):
     """
@@ -215,8 +306,9 @@ class DeepReIDSystem:
         self.face_net = FaceModel() if 'face' in modalities else None
         self.hair_net = HairModel() if 'hair' in modalities else None
         if 'color' in modalities:
-            self.body_net = BodyColorModel() # OLD
+            #self.body_net = BodyColorModel() # OLD
             #self.body_net = MaskedBodyModel()  # NEW (Segmentation + ResNet)
+            self.body_net = OSNetModel()      # SOTA ReID Model
         else:
             self.body_net = None
         
@@ -337,13 +429,13 @@ if __name__ == "__main__":
     
     # --- CONFIGURATION ---
     # Update to your actual Market-1501 path
-    # DATASET_PATH = Path("C:\\Users\\abela\\Downloads\\archive (3)\\Market-1501-v15.09.15") 
-    DATASET_PATH = Path("./duke")  # Set your DukeMTMC path here
+    DATASET_PATH = Path("C:\\Users\\abela\\Downloads\\archive (3)\\Market-1501-v15.09.15") 
+    #DATASET_PATH = Path("./duke/dukemtmc-reid/DukeMTMC-reID")  # Set your DukeMTMC path here
     
     # Market is large (19k+ images). 
     # We parse ALL first, then select a subset for speed.
-    GALLERY_LIMIT = 400  
-    QUERY_LIMIT = 50     
+    GALLERY_LIMIT = 800  
+    QUERY_LIMIT = 100     
     # ---------------------
 
     if not DATASET_PATH.exists():
@@ -418,7 +510,7 @@ if __name__ == "__main__":
 
     # --- OUTPUT GENERATION ---
     print(f"\n{'='*110}")
-    print("FINAL ABLATION STUDY RESULTS - duke (Deep Learning)")
+    print("FINAL ABLATION STUDY RESULTS - market (Deep Learning)")
     print(f"{'='*110}")
     print(f"{'Experiment':<30} | {'Rank-1':<8} | {'Rank-5':<8} | {'Rank-10':<8} | {'mAP':<8} | {'X-Cam R1':<8} | {'Queries':<8}")
     print("-" * 110)

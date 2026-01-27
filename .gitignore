@@ -5,7 +5,8 @@ market/
 
 # Ignore Market-1501 dataset under Eval
 /Eval/Market-1501-v15.09.15/
-/Eval/duke/
 /Eval/deep-person-reid/
 /Eval/__pycache__/
+/Eval/duke/
+/venv/
 

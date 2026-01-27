@@ -8,5 +8,6 @@ market/
 /Eval/deep-person-reid/
 /Eval/__pycache__/
 /Eval/duke/
+/Eval/duke_patches/
 /venv/
 

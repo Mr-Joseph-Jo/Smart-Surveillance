@@ -128,7 +128,7 @@ class FaceModel(DeepFeatureExtractor):
         print("Loading OSNet (Face Branch)...")
         self.extractor = FeatureExtractor(
             model_name='osnet_ain_x1_0',
-            model_path='./log/osnet_duke/model/model.pth.tar-50', 
+            model_path='log/osnet_duke_face/model/model.pth.tar-30',
             device=DEVICE,
             image_size=(128, 128) # Faces are square-ish, so we adjust input size
         )
@@ -162,7 +162,7 @@ class HairModel(DeepFeatureExtractor):
         print("Loading OSNet (Hair Branch)...")
         self.extractor = FeatureExtractor(
             model_name='osnet_ain_x1_0',
-            model_path='./log/osnet_duke/model/model.pth.tar-50',
+            model_path='log/osnet_duke_hair/model/model.pth.tar-30',
             device=DEVICE,
             image_size=(128, 256) # Hair is wide and short
         )
@@ -313,7 +313,7 @@ class DeepReIDSystem:
             self.body_net = None
         
         # Weights
-        self.weights = {'pose': 0.05, 'hair': 0.1, 'face': 0.15, 'color': 0.7}
+        self.weights = {'pose': 0.05, 'hair': 0.3, 'face': 0.3, 'color': 0.35}
         
     def extract(self, img):
         feats = {}
@@ -429,8 +429,8 @@ if __name__ == "__main__":
     
     # --- CONFIGURATION ---
     # Update to your actual Market-1501 path
-    DATASET_PATH = Path("C:\\Users\\abela\\Downloads\\archive (3)\\Market-1501-v15.09.15") 
-    #DATASET_PATH = Path("./duke/dukemtmc-reid/DukeMTMC-reID")  # Set your DukeMTMC path here
+    #DATASET_PATH = Path("C:\\Users\\abela\\Downloads\\archive (3)\\Market-1501-v15.09.15") 
+    DATASET_PATH = Path("./duke/dukemtmc-reid/DukeMTMC-reID")  # Set your DukeMTMC path here
     
     # Market is large (19k+ images). 
     # We parse ALL first, then select a subset for speed.
@@ -510,7 +510,7 @@ if __name__ == "__main__":
 
     # --- OUTPUT GENERATION ---
     print(f"\n{'='*110}")
-    print("FINAL ABLATION STUDY RESULTS - market (Deep Learning)")
+    print("FINAL ABLATION STUDY RESULTS - duke (Deep Learning)")
     print(f"{'='*110}")
     print(f"{'Experiment':<30} | {'Rank-1':<8} | {'Rank-5':<8} | {'Rank-10':<8} | {'mAP':<8} | {'X-Cam R1':<8} | {'Queries':<8}")
     print("-" * 110)
@@ -539,6 +539,6 @@ if __name__ == "__main__":
     plt.xticks(range(1, 21))
     plt.ylim(0, 105)
     
-    out_file = 'market1501_results.png'
+    out_file = 'duke_results.png'
     plt.savefig(out_file)
     print(f"\n[Graph] CMC Curve saved to {out_file}")

@@ -1,30 +1,35 @@
 import torchreid
 import torch
+import os
 import os.path as osp
 import glob
 from torchreid.data import ImageDataset
 
-# ==================== 1. DEFINE CUSTOM MASKED DATASET ====================
-class DukeMasked(ImageDataset):
+# ==================== 1. DEFINE GENERIC DATASET CLASS ====================
+class DukePartDataset(ImageDataset):
+    """
+    A generic dataset class that works for ANY Duke-like folder structure.
+    It works for 'upperbody', 'lowerbody', 'masked', or 'hair' 
+    as long as the root path is correct.
+    """
     def __init__(self, root='', **kwargs):
         self.root = osp.abspath(osp.expanduser(root))
         
-        # Point to the folders created by prepare_maskeddataset.py
-        # Note: We assume root points to ".../DukeMTMC-Masked"
+        # Standard DukeMTMC Subfolders
         train_dir = osp.join(self.root, 'bounding_box_train')
         query_dir = osp.join(self.root, 'query')
         gallery_dir = osp.join(self.root, 'bounding_box_test')
         
-        # Safety Check
+        # Validation: Stop immediately if folders are missing
         if not osp.exists(train_dir):
-            raise RuntimeError(f"'{train_dir}' does not exist. Did you run prepare_maskeddataset.py?")
+            raise RuntimeError(f"Dataset not found at '{train_dir}'. Did you run create_part_crops.py?")
 
         # Load and Relabel Data
         train = self.process_dir(train_dir, relabel=True)
         query = self.process_dir(query_dir, relabel=False)
         gallery = self.process_dir(gallery_dir, relabel=False)
 
-        super(DukeMasked, self).__init__(train, query, gallery, **kwargs)
+        super(DukePartDataset, self).__init__(train, query, gallery, **kwargs)
 
     def process_dir(self, dir_path, relabel=False):
         img_paths = glob.glob(osp.join(dir_path, '*.jpg'))
@@ -43,6 +48,7 @@ class DukeMasked(ImageDataset):
         return data
 
     def relabel_dataset(self, dataset):
+        # Maps disjoint PIDs (1, 5, 10) to continuous labels (0, 1, 2)
         pids = sorted(list(set([pid for _, pid, _ in dataset])))
         pid2label = {pid: i for i, pid in enumerate(pids)}
         new_dataset = []
@@ -50,36 +56,38 @@ class DukeMasked(ImageDataset):
             new_dataset.append((img_path, pid2label[pid], camid))
         return new_dataset
 
-# Register it so DataManager can find it
-torchreid.data.register_image_dataset('duke_masked', DukeMasked)
+# Register the class under a generic name
+torchreid.data.register_image_dataset('duke_custom', DukePartDataset)
 
-# ==================== 2. MAIN TRAINING LOOP ====================
+# ==================== 2. TRAINING FUNCTION ====================
 
-def main():
-    # --- CONFIGURATION ---
-    # Point this to the OUTPUT folder from your previous script
-    MASKED_DATA_PATH = "./duke-Masked" 
-    MAX_EPOCHS = 60       # Increased slightly for better convergence on clean data
-    BATCH_SIZE = 64       # Increased to 64 (Better for Batch Normalization)
-    
-    print(f"Initializing Data Manager for Duke Masked Dataset...")
+def train_part(part_name, root_path):
+    print(f"\n{'='*60}")
+    print(f"STARTING TRAINING FOR: {part_name.upper()} EXPERT")
+    print(f"Data Root: {root_path}")
+    print(f"{'='*60}")
 
-    # 3. Data Manager
+    # 1. Configuration
+    MAX_EPOCHS = 30       # 60 is the sweet spot for specialized parts
+    BATCH_SIZE = 64       # High batch size stabilizes BatchNorm
+    SAVE_DIR = f'log/osnet_duke_{part_name}'
+
+    # 2. Data Manager
+    # We pass the specific ROOT path for this part
     datamanager = torchreid.data.ImageDataManager(
-        root=MASKED_DATA_PATH,
-        sources='duke_masked',  # Use our custom name
-        targets='duke_masked',
-        height=256,
-        width=128,
+        root=root_path,
+        sources='duke_custom',  # Calls DukePartDataset(root=root_path)
+        targets='duke_custom',
+        height=128,             # Parts are smaller, so 128x128 is perfect
+        width=128,              # Square aspect ratio for parts works best
         batch_size_train=BATCH_SIZE,
         batch_size_test=100,
-        # Add random erasing - very helpful for Re-ID
-        transforms=['random_flip', 'random_crop', 'random_erase'] 
+        transforms=['random_flip', 'random_erase', 'color_jitter'] # Strong augmentation
     )
 
     print(f"Building Model: OSNet (AIN)...")
 
-    # 4. Build Model
+    # 3. Build Model
     model = torchreid.models.build_model(
         name='osnet_ain_x1_0',
         num_classes=datamanager.num_train_pids,
@@ -89,7 +97,7 @@ def main():
 
     model = model.cuda()
 
-    # 5. Optimizer & Scheduler
+    # 4. Optimizer & Scheduler
     optimizer = torchreid.optim.build_optimizer(
         model,
         optim='adam',
@@ -99,10 +107,10 @@ def main():
     scheduler = torchreid.optim.build_lr_scheduler(
         optimizer,
         lr_scheduler='single_step',
-        stepsize=25  # Adjusted for 60 epochs
+        stepsize=30 
     )
 
-    # 6. Engine
+    # 5. Engine
     engine = torchreid.engine.ImageSoftmaxEngine(
         datamanager,
         model,
@@ -111,18 +119,28 @@ def main():
         label_smooth=True
     )
 
-    # 7. Run Training
-    # We save to a DIFFERENT folder so we can compare later
-    SAVE_DIR = 'log/osnet_duke_masked'
-    
-    print(f"Starting Training... Logs will be saved to {SAVE_DIR}")
+    # 6. Run
+    print(f"Training {part_name}... Logs will be saved to {SAVE_DIR}")
     engine.run(
         save_dir=SAVE_DIR,
         max_epoch=MAX_EPOCHS,
         eval_freq=10,
-        print_freq=10,
-        test_only=False
+        print_freq=5,
+        test_only=False,
+        fixbase_epoch=3 # Freeze base layers briefly to adapt to new part domain
     )
 
+# ==================== 3. MAIN EXECUTION ====================
+
 if __name__ == '__main__':
-    main()
+    # Train Upper Body Expert
+    train_part(
+        part_name='upper', 
+        root_path='./duke_patches/upperbody'
+    )
+    
+    # Train Lower Body Expert
+    train_part(
+        part_name='lower', 
+        root_path='./duke_patches/lowerbody'
+    )

@@ -9,8 +9,8 @@ import torch
 
 # CONFIGURATION
 SOURCE_DATASET = "./duke/dukemtmc-reid/DukeMTMC-reID"
-OUTPUT_FACE = "./duke_patches/face"
-OUTPUT_HAIR = "./duke_patches/hair"
+OUTPUT_UPPER = "./duke_patches/upperbody"
+OUTPUT_LOWER = "./duke_patches/lowerbody"
 
 def create_crops():
     # 1. Setup Models
@@ -20,8 +20,8 @@ def create_crops():
     
     # 2. Setup Directories
     for subset in ['bounding_box_train', 'bounding_box_test', 'query']:
-        os.makedirs(f"{OUTPUT_FACE}/{subset}", exist_ok=True)
-        os.makedirs(f"{OUTPUT_HAIR}/{subset}", exist_ok=True)
+        os.makedirs(f"{OUTPUT_UPPER}/{subset}", exist_ok=True)
+        os.makedirs(f"{OUTPUT_LOWER}/{subset}", exist_ok=True)
 
     # 3. Process all images
     image_paths = glob.glob(f"{SOURCE_DATASET}/**/*.jpg", recursive=True)
@@ -49,70 +49,88 @@ def create_crops():
         kps = res.keypoints.xy[0].cpu().numpy()
         conf = res.keypoints.conf[0].cpu().numpy()
         
-        # Skip if low confidence
-        if np.mean(conf) < 0.35: continue 
+        # Skip if low overall confidence
+        if np.mean(conf) < 0.4: continue 
         
-        # --- ROBUST ANCHOR LOGIC (Matches your System) ---
-        nose = kps[0]
-        left_eye = kps[1]
-        right_eye = kps[2]
-        
-        # 1. Find Center X (Anchor)
-        if nose[0] > 0:
-            center_x = nose[0]
-            anchor_y = nose[1]
-        elif left_eye[0] > 0 and right_eye[0] > 0:
-            center_x = (left_eye[0] + right_eye[0]) / 2
-            anchor_y = (left_eye[1] + right_eye[1]) / 2
-        else:
-            continue # Can't find head center
+        # --- DEFINE BODY PARTS INDICES (COCO Format) ---
+        # 5,6: Shoulders | 11,12: Hips | 15,16: Ankles
+        L_SHOULDER, R_SHOULDER = 5, 6
+        L_HIP, R_HIP = 11, 12
+        L_ANKLE, R_ANKLE = 15, 16
 
-        # 2. Estimate Head Width
-        if left_eye[0] > 0 and right_eye[0] > 0:
-            head_width = np.linalg.norm(left_eye - right_eye) * 2.5
-        else:
-            head_width = img.shape[1] * 0.35 # Fallback: 35% of image width
+        h_img, w_img = img.shape[:2]
 
-        half_w = int(head_width / 2)
-        img_h, img_w = img.shape[:2]
+        # =========================================================
+        # 1. UPPER BODY CROP (Shoulders to Hips)
+        # =========================================================
+        # We need at least one shoulder and one hip to define the box
+        has_shoulder = (kps[L_SHOULDER][0] > 0 or kps[R_SHOULDER][0] > 0)
+        has_hip = (kps[L_HIP][0] > 0 or kps[R_HIP][0] > 0)
 
-        # --- FACE PATCH GENERATION ---
-        # Face is roughly centered on the anchor (nose/eyes)
-        # We take a square box based on head_width
-        face_size = int(head_width * 1.5) # slightly larger than head width
-        half_face = int(face_size / 2)
-        
-        fx1 = int(max(0, center_x - half_face))
-        fx2 = int(min(img_w, center_x + half_face))
-        fy1 = int(max(0, anchor_y - half_face))
-        fy2 = int(min(img_h, anchor_y + half_face))
-        
-        face_crop = img[fy1:fy2, fx1:fx2]
-        
-        # Save Face if valid size
-        if face_crop.size > 0 and face_crop.shape[0] > 15 and face_crop.shape[1] > 15:
-            # OPTIONAL: Resize here to save disk space/training time, or let Dataloader do it
-            # cv2.resize(face_crop, (128, 128)) 
-            cv2.imwrite(f"{OUTPUT_FACE}/{subset}/{filename}", face_crop)
+        if has_shoulder and has_hip:
+            # Gather valid points
+            ys_shoulder = [p[1] for p in [kps[L_SHOULDER], kps[R_SHOULDER]] if p[0]>0]
+            ys_hip = [p[1] for p in [kps[L_HIP], kps[R_HIP]] if p[0]>0]
+            
+            # Y-Coords: Top is highest shoulder, Bottom is lowest hip
+            y1 = min(ys_shoulder)
+            y2 = max(ys_hip)
+            
+            # X-Coords: Center of torso based on all valid points
+            valid_x = [p[0] for p in [kps[L_SHOULDER], kps[R_SHOULDER], kps[L_HIP], kps[R_HIP]] if p[0]>0]
+            if len(valid_x) > 0:
+                center_x = np.mean(valid_x)
+                # Width: either the spread of points OR a fallback width
+                spread = max(valid_x) - min(valid_x)
+                width = max(spread * 1.5, w_img * 0.4) # Ensure it's not too skinny
+                
+                # Expand Top to include Head/Neck (go up 20% of torso height)
+                torso_h = y2 - y1
+                y1_final = max(0, y1 - (torso_h * 0.3)) 
+                y2_final = min(h_img, y2 + (torso_h * 0.1)) # Slightly below hips
+                
+                x1_final = int(max(0, center_x - width/2))
+                x2_final = int(min(w_img, center_x + width/2))
+                
+                upper_crop = img[int(y1_final):int(y2_final), x1_final:x2_final]
+                
+                # Save if valid
+                if upper_crop.size > 0 and upper_crop.shape[0] > 20 and upper_crop.shape[1] > 20:
+                    # Optional: Resize to 128x128 for training stability
+                    upper_crop = cv2.resize(upper_crop, (128, 128))
+                    cv2.imwrite(f"{OUTPUT_UPPER}/{subset}/{filename}", upper_crop)
 
-        # --- HAIR PATCH GENERATION ---
-        # Hair is from the anchor UPWARDS.
-        # X range: Same centered X as face
-        # Y range: From well above the head down to the eyes
+        # =========================================================
+        # 2. LOWER BODY CROP (Hips to Ankles)
+        # =========================================================
+        # We need hips and ankles (or at least knees if ankles missing, but let's stick to ankles for robustness)
+        has_ankle = (kps[L_ANKLE][0] > 0 or kps[R_ANKLE][0] > 0)
         
-        hx1 = int(max(0, center_x - half_w))
-        hx2 = int(min(img_w, center_x + half_w))
-        
-        # Hair "Bottom" is the eyes/nose
-        hy2 = int(anchor_y) 
-        # Hair "Top" is guessed based on head width (approx 1.5x width upwards)
-        hy1 = int(max(0, hy2 - (head_width * 1.2)))
-        
-        hair_crop = img[hy1:hy2, hx1:hx2]
-        
-        # Save Hair if valid size
-        if hair_crop.size > 0 and hair_crop.shape[0] > 10 and hair_crop.shape[1] > 10:
-             cv2.imwrite(f"{OUTPUT_HAIR}/{subset}/{filename}", hair_crop)
+        if has_hip and has_ankle:
+            ys_hip = [p[1] for p in [kps[L_HIP], kps[R_HIP]] if p[0]>0]
+            ys_ankle = [p[1] for p in [kps[L_ANKLE], kps[R_ANKLE]] if p[0]>0]
+            
+            y1 = min(ys_hip)
+            y2 = max(ys_ankle)
+            
+            valid_x = [p[0] for p in [kps[L_HIP], kps[R_HIP], kps[L_ANKLE], kps[R_ANKLE]] if p[0]>0]
+            
+            if len(valid_x) > 0:
+                center_x = np.mean(valid_x)
+                spread = max(valid_x) - min(valid_x)
+                width = max(spread * 1.6, w_img * 0.45) # Legs need more width for walking stride
+                
+                y1_final = max(0, y1)
+                y2_final = min(h_img, y2 + (y2-y1)*0.1) # Include shoes
+                
+                x1_final = int(max(0, center_x - width/2))
+                x2_final = int(min(w_img, center_x + width/2))
+                
+                lower_crop = img[int(y1_final):int(y2_final), x1_final:x2_final]
+                
+                if lower_crop.size > 0 and lower_crop.shape[0] > 20 and lower_crop.shape[1] > 20:
+                    lower_crop = cv2.resize(lower_crop, (128, 128))
+                    cv2.imwrite(f"{OUTPUT_LOWER}/{subset}/{filename}", lower_crop)
 
 if __name__ == "__main__":
     create_crops()

@@ -9,5 +9,6 @@ market/
 /Eval/__pycache__/
 /Eval/duke/
 /Eval/duke_patches/
+/Eval/duke_patches_old/
 /venv/
 

@@ -8,101 +8,111 @@ import numpy as np
 import torch
 
 # CONFIGURATION
-# Ensure this points to where your DukeMTMC-reID folder actually sits
-SOURCE_DATASET = "./duke/dukemtmc-reid/DukeMTMC-reID"  
-OUTPUT_FACE = "./duke_patches/face"                   
-OUTPUT_HAIR = "./duke_patches/hair"                   
+SOURCE_DATASET = "./duke/dukemtmc-reid/DukeMTMC-reID"
+OUTPUT_FACE = "./duke_patches/face"
+OUTPUT_HAIR = "./duke_patches/hair"
 
 def create_crops():
     # 1. Setup Models
     print("Loading YOLOv8-Pose...")
-    # Check for GPU
     device = 0 if torch.cuda.is_available() else 'cpu'
     pose_model = YOLO('yolov8n-pose.pt')
     
-    # 2. Setup Directories (Mimic ReID structure)
+    # 2. Setup Directories
     for subset in ['bounding_box_train', 'bounding_box_test', 'query']:
         os.makedirs(f"{OUTPUT_FACE}/{subset}", exist_ok=True)
         os.makedirs(f"{OUTPUT_HAIR}/{subset}", exist_ok=True)
 
     # 3. Process all images
     image_paths = glob.glob(f"{SOURCE_DATASET}/**/*.jpg", recursive=True)
-    
     print(f"Found {len(image_paths)} images to process...")
     
     for img_path in tqdm(image_paths):
-        # Determine subset (train/test/query)
+        # Determine subset
         path_parts = Path(img_path).parts
         if 'bounding_box_train' in path_parts: subset = 'bounding_box_train'
         elif 'bounding_box_test' in path_parts: subset = 'bounding_box_test'
         elif 'query' in path_parts: subset = 'query'
-        else: continue # Skip other files (like gallery or distractor sets if present)
+        else: continue 
             
         filename = os.path.basename(img_path)
         img = cv2.imread(img_path)
         if img is None: continue
         
-        # Run Inference
+        # Inference
         results = pose_model(img, verbose=False, device=device)
-        
-        # --- BUG FIX START ---
-        # Check if results exist AND if keypoints were actually detected
-        if not results: 
-            continue
+        if not results: continue
             
         res = results[0]
-        # Check if keypoints container exists and has at least one detection
-        if res.keypoints is None or res.keypoints.xy.shape[0] == 0:
-            continue
-        # --- BUG FIX END ---
+        if res.keypoints is None or res.keypoints.xy.shape[0] == 0: continue
         
         kps = res.keypoints.xy[0].cpu().numpy()
         conf = res.keypoints.conf[0].cpu().numpy()
         
-        # Need nose (0) and eyes (1,2) for valid face/hair
-        # If overall confidence of keypoints is too low, skip
-        if np.mean(conf) < 0.4: continue 
+        # Skip if low confidence
+        if np.mean(conf) < 0.35: continue 
         
-        # --- CROP LOGIC ---
-        h, w = img.shape[:2]
+        # --- ROBUST ANCHOR LOGIC (Matches your System) ---
         nose = kps[0]
+        left_eye = kps[1]
+        right_eye = kps[2]
         
-        # Check if nose was actually detected (confidence > 0 or x,y > 0)
-        if nose[0] == 0 and nose[1] == 0: continue
+        # 1. Find Center X (Anchor)
+        if nose[0] > 0:
+            center_x = nose[0]
+            anchor_y = nose[1]
+        elif left_eye[0] > 0 and right_eye[0] > 0:
+            center_x = (left_eye[0] + right_eye[0]) / 2
+            anchor_y = (left_eye[1] + right_eye[1]) / 2
+        else:
+            continue # Can't find head center
 
-        # FACE CROP (Nose + Eyes region)
-        # Simple heuristic: Box around facial keypoints (0..4 are nose, eyes, ears)
-        face_pts = kps[:5] 
-        valid_face = face_pts[face_pts[:,0] > 0]
+        # 2. Estimate Head Width
+        if left_eye[0] > 0 and right_eye[0] > 0:
+            head_width = np.linalg.norm(left_eye - right_eye) * 2.5
+        else:
+            head_width = img.shape[1] * 0.35 # Fallback: 35% of image width
+
+        half_w = int(head_width / 2)
+        img_h, img_w = img.shape[:2]
+
+        # --- FACE PATCH GENERATION ---
+        # Face is roughly centered on the anchor (nose/eyes)
+        # We take a square box based on head_width
+        face_size = int(head_width * 1.5) # slightly larger than head width
+        half_face = int(face_size / 2)
         
-        if len(valid_face) >= 3:
-            x1, y1 = np.min(valid_face, axis=0)
-            x2, y2 = np.max(valid_face, axis=0)
-            
-            # Add padding to get the whole head/face context
-            pad_x = int((x2-x1) * 0.5)
-            pad_y = int((y2-y1) * 0.5)
-            
-            y_min = max(0, int(y1-pad_y))
-            y_max = min(h, int(y2+pad_y))
-            x_min = max(0, int(x1-pad_x))
-            x_max = min(w, int(x2+pad_x))
-            
-            face_crop = img[y_min:y_max, x_min:x_max]
-            
-            # Only save if crop is valid and not tiny
-            if face_crop.size > 0 and face_crop.shape[0] > 10 and face_crop.shape[1] > 10:
-                cv2.imwrite(f"{OUTPUT_FACE}/{subset}/{filename}", face_crop)
+        fx1 = int(max(0, center_x - half_face))
+        fx2 = int(min(img_w, center_x + half_face))
+        fy1 = int(max(0, anchor_y - half_face))
+        fy2 = int(min(img_h, anchor_y + half_face))
+        
+        face_crop = img[fy1:fy2, fx1:fx2]
+        
+        # Save Face if valid size
+        if face_crop.size > 0 and face_crop.shape[0] > 15 and face_crop.shape[1] > 15:
+            # OPTIONAL: Resize here to save disk space/training time, or let Dataloader do it
+            # cv2.resize(face_crop, (128, 128)) 
+            cv2.imwrite(f"{OUTPUT_FACE}/{subset}/{filename}", face_crop)
 
-        # HAIR CROP (Top of head to nose)
-        # Heuristic: From top of image (0) down to nose (y)
-        # Note: In ReID bbox, top of image is usually top of head anyway
-        hair_bottom = int(nose[1])
-        if hair_bottom > 5: # Ensure we have at least 5 pixels of height
-            hair_crop = img[0:hair_bottom, :]
-            
-            if hair_crop.size > 0:
-                cv2.imwrite(f"{OUTPUT_HAIR}/{subset}/{filename}", hair_crop)
+        # --- HAIR PATCH GENERATION ---
+        # Hair is from the anchor UPWARDS.
+        # X range: Same centered X as face
+        # Y range: From well above the head down to the eyes
+        
+        hx1 = int(max(0, center_x - half_w))
+        hx2 = int(min(img_w, center_x + half_w))
+        
+        # Hair "Bottom" is the eyes/nose
+        hy2 = int(anchor_y) 
+        # Hair "Top" is guessed based on head width (approx 1.5x width upwards)
+        hy1 = int(max(0, hy2 - (head_width * 1.2)))
+        
+        hair_crop = img[hy1:hy2, hx1:hx2]
+        
+        # Save Hair if valid size
+        if hair_crop.size > 0 and hair_crop.shape[0] > 10 and hair_crop.shape[1] > 10:
+             cv2.imwrite(f"{OUTPUT_HAIR}/{subset}/{filename}", hair_crop)
 
 if __name__ == "__main__":
     create_crops()

@@ -9,4 +9,7 @@ market/
 /Eval/__pycache__/
 /Eval/duke/
 /venv/
-
+/Eval/archive
+/Eval/deep-person-reid-master
+/Eval/DukeMTMC-Masked
+/Eval/DukeMtmc-reid

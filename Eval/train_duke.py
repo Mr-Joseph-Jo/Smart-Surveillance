@@ -68,8 +68,8 @@ def train_part(part_name, root_path):
     print(f"{'='*60}")
 
     # 1. Configuration
-    MAX_EPOCHS = 30       # 60 is the sweet spot for specialized parts
-    BATCH_SIZE = 64       # High batch size stabilizes BatchNorm
+    MAX_EPOCHS = 350       # 60 is the sweet spot for specialized parts
+    BATCH_SIZE = 128       # High batch size stabilizes BatchNorm
     SAVE_DIR = f'log/osnet_duke_{part_name}'
 
     # 2. Data Manager

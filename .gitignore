@@ -8,6 +8,9 @@ market/
 /Eval/deep-person-reid/
 /Eval/__pycache__/
 /Eval/duke/
+/Eval/duke_patches/
+/Eval/duke_patches_old/
+/Eval/duke-Masked
 /venv/
 /Eval/archive
 /Eval/deep-person-reid-master

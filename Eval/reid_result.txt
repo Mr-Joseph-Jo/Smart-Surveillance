@@ -1,0 +1,7 @@
+Market-1501 ReID Result
+========================================
+Experiment: ResNet50 ReID
+Rank-1 Accuracy: 0.00%
+Correct matches: 0/100
+Gallery images: 500
+Query images: 100

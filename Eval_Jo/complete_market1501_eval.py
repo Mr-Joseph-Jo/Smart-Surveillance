@@ -6,7 +6,7 @@ Experiments:
 1. Pose Only
 2. Pose + Hair
 3. Pose + Hair + Face
-4. Pose + Hair + Face + Color (Full Multi-modal)
+4. Pose + Hair + Face + Color
 """
 
 import cv2
@@ -94,7 +94,7 @@ class PoseFeatureExtractor:
             kps = results[0].keypoints.xy[0].cpu().numpy()
             conf = results[0].keypoints.conf[0].cpu().numpy() if results[0].keypoints.conf is not None else np.ones(17)
             
-            if len(kps) < 17 or np.mean(conf) < 0.4: return None
+            if len(kps) < 17 or np.mean(conf) < 0.3: return None
 
             # Simple geometric features
             feats = {}
@@ -207,7 +207,7 @@ class ColorFeatureExtractor:
         if image is None: return None
         h, w = image.shape[:2]
         
-        # Smart split
+        # Smart split using Keypoints
         split_y = h // 2
         if kps is not None:
             shoulders_y = (kps[5][1] + kps[6][1]) / 2
@@ -277,16 +277,18 @@ class MultiModalReID:
         if 'face' in modalities: self.extractors['face'] = FaceFeatureExtractor()
         if 'color' in modalities: self.extractors['color'] = ColorFeatureExtractor()
 
-        # UPDATED WEIGHTS FOR BETTER COLOR PERFORMANCE
+        # FIXED WEIGHTS (Optimized for Market-1501)
         self.raw_weights = {
             'pose': 0.15,
             'hair': 0.10,
             'face': 0.05,
-            'color': 0.70  # Color boosted significantly
+            'color': 0.70  # Color boosted heavily as it's the strongest signal
         }
         
+        # Normalize weights based on active modalities
         total = sum(self.raw_weights[m] for m in modalities)
         self.weights = {m: self.raw_weights[m]/total for m in modalities}
+        print(f"Active Weights: {self.weights}")
 
     def extract(self, img):
         feats = {}
@@ -309,6 +311,7 @@ class MultiModalReID:
                 score += s * self.weights[m]
         return score
 
+
 # ==================== 4. EVALUATION & MAIN ====================
 
 class MarketEvaluator:
@@ -327,7 +330,8 @@ class MarketEvaluator:
     def run(self, system, name):
         print(f"\n--- Experiment: {name} ---")
         
-        # Extract Gallery (Subset for speed, remove slice [:N] for full)
+        # Extract Gallery (Using 400 samples for demonstration speed)
+        # To run FULL dataset, change [:400] to [:]
         gal_feats = []
         print("Extracting Gallery...")
         for s in tqdm(self.gallery[:400]): 
@@ -349,28 +353,59 @@ class MarketEvaluator:
         for q in q_feats:
             matches = []
             for g in gal_feats:
+                # Junk filter (Same person, same camera)
                 if q['s'].person_id == g['s'].person_id and q['s'].camera_id == g['s'].camera_id: continue
                 sim = system.compute_sim(q['f'], g['f'])
-                matches.append({'match': q['s'].person_id == g['s'].person_id, 'sim': sim})
+                matches.append({
+                    'person_id': g['s'].person_id,
+                    'match': q['s'].person_id == g['s'].person_id, 
+                    'sim': sim
+                })
             matches.sort(key=lambda x: x['sim'], reverse=True)
-            results.append(matches)
+            results.append({
+                'query_id': q['s'].person_id,
+                'matches': matches,
+                'top5_matches': matches[:5]
+            })
             
-        # Metrics
-        r1 = np.mean([1 if r[0]['match'] else 0 for r in results])
+        # Metrics Calculation
+        # Rank-1: Correct person is at position 1
+        r1 = np.mean([1 if r['matches'][0]['match'] else 0 for r in results])
         
+        # Rank-5: Correct person is within top 5 positions
+        r5 = np.mean([1 if any(m['match'] for m in r['top5_matches']) else 0 for r in results])
+        
+        # mAP calculation
         aps = []
         for r in results:
             corr, score = 0, 0.0
-            for i, m in enumerate(r):
+            for i, m in enumerate(r['matches']):
                 if m['match']:
                     corr += 1
                     score += corr / (i+1)
             aps.append(score/corr if corr else 0)
         
-        return {'name': name, 'r1': r1, 'map': np.mean(aps)}
+        # Calculate CMC Curve (Top 20 ranks)
+        cmc = np.zeros(20)
+        for r in results:
+            for i in range(min(len(r['matches']), 20)):
+                if r['matches'][i]['match']:
+                    cmc[i:] += 1
+                    break
+        cmc = cmc / len(results) if len(results) > 0 else cmc
+
+        return {
+            'name': name, 
+            'r1': r1, 
+            'r5': r5,
+            'map': np.mean(aps), 
+            'cmc': cmc
+        }
 
 if __name__ == "__main__":
-    DATASET_PATH = "./Market-1501-v15.09.15" # UPDATE THIS PATH
+    # --- CONFIGURATION ---
+    DATASET_PATH = "./Market-1501-v15.09.15" # Set your path here
+    # ---------------------
     
     if not os.path.exists(DATASET_PATH):
         print(f"Error: Dataset not found at {DATASET_PATH}")
@@ -386,15 +421,93 @@ if __name__ == "__main__":
         # 3. Pose + Hair + Face
         r3 = evaluator.run(MultiModalReID(['pose', 'hair', 'face']), "Pose + Hair + Face")
         
-        # 4. Full Multi-modal
-        r4 = evaluator.run(MultiModalReID(['pose', 'hair', 'face', 'color']), "Full Multi-modal")
+        # 4. Pose + Hair + Face + Color
+        r4 = evaluator.run(MultiModalReID(['pose', 'hair', 'face', 'color']), "Pose + Hair + Face + Color")
         
-        # Final Summary
-        print("\n" + "="*60)
+        # ==========================================
+        # VISUALIZATION & OUTPUTS
+        # ==========================================
+        
+        results_list = [r1, r2, r3, r4]
+        
+        # 1. Print Text Table with Rank-1 and Rank-5
+        print("\n" + "="*80)
         print("FINAL ABLATION STUDY RESULTS")
-        print("="*60)
-        print(f"{'Experiment':<30} | {'Rank-1':<10} | {'mAP':<10}")
-        print("-" * 60)
-        for res in [r1, r2, r3, r4]:
-            print(f"{res['name']:<30} | {res['r1']*100:>6.2f}%   | {res['map']*100:>6.2f}%")
-        print("="*60)
+        print("="*80)
+        print(f"{'Experiment':<35} | {'Rank-1':<10} | {'Rank-5':<10} | {'mAP':<10}")
+        print("-" * 80)
+        for res in results_list:
+            print(f"{res['name']:<35} | {res['r1']*100:>6.2f}%   | {res['r5']*100:>6.2f}%   | {res['map']*100:>6.2f}%")
+        print("="*80)
+        
+        print("\nKey Definitions:")
+        print("- Rank-1: Highest confidence match is correct (most strict)")
+        print("- Rank-5: Correct match appears in top 5 highest confidence predictions")
+        print("- mAP: Mean Average Precision (considers all ranks)")
+        
+        # 2. Generate CMC Curve Plot 
+        plt.figure(figsize=(10, 6))
+        markers = ['^', 's', 'o', '*']
+        colors = ['gray', 'blue', 'orange', 'red']
+        
+        for idx, res in enumerate(results_list):
+            plt.plot(range(1, 21), res['cmc'] * 100, 
+                     label=res['name'], 
+                     marker=markers[idx], 
+                     color=colors[idx],
+                     linewidth=2)
+                     
+        plt.title('CMC Curve: Ablation Study', fontsize=14)
+        plt.xlabel('Rank', fontsize=12)
+        plt.ylabel('Matching Accuracy (%)', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.xticks(range(1, 21))
+        
+        # Add Rank-1 and Rank-5 markers
+        plt.axvline(x=1, color='black', linestyle=':', alpha=0.3)
+        plt.axvline(x=5, color='black', linestyle=':', alpha=0.3)
+        
+        out_cmc = Path(DATASET_PATH).parent / 'cmc_curve.png'
+        plt.savefig('cmc_curve.png', dpi=300, bbox_inches='tight')
+        print(f"\n[Graph] Saved CMC curve to cmc_curve.png")
+        
+        # 3. Generate Bar Chart Comparison with all metrics
+        plt.figure(figsize=(12, 7))
+        names = [r['name'].replace('Pose + ', 'P+').replace('Hair', 'H').replace('Face', 'F').replace('Color', 'C') 
+                for r in results_list]
+        
+        # Prepare data
+        metrics_data = {
+            'Rank-1': [r['r1']*100 for r in results_list],
+            'Rank-5': [r['r5']*100 for r in results_list],
+            'mAP': [r['map']*100 for r in results_list]
+        }
+        
+        x = np.arange(len(names))
+        width = 0.25
+        colors_metrics = ['#4c72b0', '#dd8452', '#55a868']
+        
+        # Plot bars for each metric
+        for idx, (metric_name, values) in enumerate(metrics_data.items()):
+            plt.bar(x + idx*width - width, values, width, 
+                   label=metric_name, 
+                   color=colors_metrics[idx],
+                   edgecolor='black')
+        
+        plt.ylabel('Score (%)', fontsize=12)
+        plt.title('Performance Comparison by Modality and Metric', fontsize=14)
+        plt.xticks(x, names, rotation=15, fontsize=11)
+        plt.legend(fontsize=11)
+        plt.grid(axis='y', linestyle='--', alpha=0.5)
+        
+        # Add value labels on bars
+        ax = plt.gca()
+        for bars in ax.containers:
+            ax.bar_label(bars, fmt='%.1f%%', padding=3, fontsize=9)
+        
+        plt.savefig('performance_comparison.png', dpi=300, bbox_inches='tight')
+        print(f"[Graph] Saved comparison bar chart to performance_comparison.png")
+        
+       
+        plt.show()
